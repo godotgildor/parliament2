@@ -2,11 +2,99 @@
 
 import argparse
 import subprocess
-import gzip
+import logging
+import multiprocessing
 import os
+import time
 
+class WeightedPool():
+    """This class provides a multiprocessing.Pool like interface with the
+    added ability to specify the weight of a process to execute. The class
+    is not thread-safe, so users should only use a given WeightedPool object
+    in a single thread.
+    """
+
+    def __init__(self, max_weight=multiprocessing.cpu_count(), poll_interval=2):
+        """Create a new WeightedPool object.
+
+        Args:
+            max_weight (float/int): The maximum weight for this given pool.
+            poll_interval (int): The number of seconds to wait when checking
+                for completed processes in our process pool.
+        """
+        self._max_weight = max_weight
+        self._poll_interval = poll_interval
+        self._current_weight = 0
+        self._current_pool = set()
+    
+    def _update_pool(self):
+        """This method will look at all process currently in progress and check
+        to see if any have completed. It will remove any completed process from the 
+        pool and will subtract their weights from the total weight of the pool.
+        """
+        # We'll keep track of which processes have completed and their weights.
+        to_delete = set()
+        completed_weight = 0
+
+        for (process, weight, cmd) in self._current_pool:
+            status = process.poll()
+            # A status of None indicates the process is still running.
+            if status is not None:
+                to_delete.add((process, weight, cmd))
+                completed_weight += weight
+            # We'll warn if we received a non-zero exit code. Perhaps add a feature
+            # later that would permit the user to choose to error instead?
+            if status is not None and status != 0:
+                logging.warn('Command {} exited with status {}.'.format(cmd, status))
+        self._current_pool -= to_delete
+        self._current_weight -= completed_weight
+
+
+    def _wait_for_weight(self, weight_target):
+        """This method will block until the current pool has at most the stated
+        weight target.
+
+        Args:
+            weight_target (float/int): Block until our pool has at most this weight.
+        """
+        self._update_pool()
+        while self._current_weight > weight_target:
+            time.sleep(self._poll_interval)
+            self._update_pool()
+
+
+    def apply_async(self, cmd, weight=1, stdout=None, stderr=None):
+        """This method will submit a process to our weighted pool. If there is not
+        room in our pool, it will block until it can submit the process. This means
+        there could be a deadlock condition if no jobs in the pool complete. 
+
+        Args:
+            cmd (list of strings): The command to be executed (will be passed to 
+                subprocess.Popen())
+            weight (float/int): The weight for the given process. This is the size that
+                will be taken up in our pool.
+            stdout (File handler): A file handler to store the stdout.
+            stderr (File handler): A file handler to store the stderr.
+        """
+        # First, wait until we have room in our 
+        self._wait_for_weight(self._max_weight - weight)
+        process = subprocess.Popen(cmd, stdout=stdout, stderr=stderr)
+        self._current_weight += weight
+        self._current_pool.add((process, weight, subprocess.list2cmdline(cmd)))
+
+
+    def join(self):
+        """This method will wait until all processes in our pool are complete.
+        """
+        self._wait_for_weight(0)
+            
 
 def parse_arguments():
+    """This function will parse the arguments to our program.
+
+    Returns:
+        A structure with the parsed arguments.
+    """
     args = argparse.ArgumentParser(description='Parliament2')
     args.add_argument('--bam', required=True, help="The name of the Illumina BAM file for which to call structural variants containing mapped reads.")
     args.add_argument('--bai', required=False, help="(Optional) The name of the corresponding index for the Illumina BAM file.")
@@ -26,9 +114,13 @@ def parse_arguments():
     args.add_argument('--genotype', action="store_true", help="If selected, candidate events determined from the individual callers will be genotyped and merged to create a consensus output.")
     args.add_argument('--svviz', action="store_true", help="If selected, visualizations of genotyped SV events will be produced with SVVIZ, one screenshot of support per event. For this option to take effect, Genotype must be selected.")
     args.add_argument('--svviz_only_validated_candidates', action="store_true", help="Run SVVIZ only on validated candidates? For this option to be relevant, SVVIZ must be selected. NOT selecting this will make the SVVIZ component run longer.")
-    args.add_argument('--dnanexus', action="store_true", help=argparse.SUPPRESS)
+    args.add_argument('--verbose', '-v', action="store_true", help="Print verbose logging information.")
 
-    return args.parse_args()
+    parsed_args = args.parse_args()
+    if parsed_args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
+
+    return parsed_args
 
 
 def gunzip_input(input_file):
