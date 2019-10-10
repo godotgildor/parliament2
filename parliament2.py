@@ -18,6 +18,8 @@ SV_CALLER_WEIGHTS = {
     'lumpy': 1
 }
 
+LUMPY_EXCLUDE_BED_FILENAME = '/resources/{genome}.bed'
+
 class WeightedPool():
     """This class provides a multiprocessing.Pool like interface with the
     added ability to specify the weight of a process to execute. The class
@@ -132,6 +134,42 @@ def parse_arguments():
     return parsed_args
 
 
+def get_reference_genome_name(ref_genome_filename):
+    """Sniff the given reference genome and make a decision about what
+    human reference version it represents.
+
+    Args:
+        ref_genome_filename (string): The filename for the reference genome FASTA
+
+    Returns:
+        A string stating whether the reference appears to be hg19, b37, or hg38.
+    """
+
+    # TODO The logic here looks very shaky. We may want to consider switching to
+    # a more robust method.
+    # The logic:
+    #        1. If the contig names do not start with chr, then it is b37
+    #        2. If we see a contig line for chr1 and LN:248956422 is in that line, then it is hg38
+    #        3. Otherwise, if the contig names begin with chr and there are 195 contigs it is hg38, 
+    #           otherwise hg19
+    
+    number_of_contigs = 0
+    with open(ref_genome_filename) as fh:
+        for line in fh:
+            if line.startswith('>'):
+                if not line.startswith('>chr'):
+                    return 'b37'
+                elif line.startswith(">chr1") and "LN:248956422" in line:
+                    return 'hg38'
+                else:
+                    number_of_contigs += 1
+    
+    if number_of_contigs == 195:
+        return 'hg38'
+
+    return 'hg19'
+
+
 def gunzip_input(filename, overwrite=False):
     """Gunzip the given file.
 
@@ -189,7 +227,7 @@ def run_parliament(bam_filename,
         svviz (boolean): Should we create visualization outputs?
         svviz_only_validated_candidates (boolean): Should we run only visualize validated candidates?
     """
-    foo = 1
+    lumpy_bed = LUMPY_EXCLUDE_BED_FILENAME.format(genome=get_reference_genome_name(ref_genome_filename))
 
 
 def main():
@@ -199,6 +237,17 @@ def main():
         args.prefix = os.path.splitext(args.bam)[0]
     args.run_delly = any([args.delly_deletion, args, args.delly_insertion, args.delly_inversion, args.delly_duplication])
     args.ref_genome = gunzip_input(args.ref_genome)
+
+    # Check that at least one of the SV callers was set to run.
+    if not any([args.breakdancer, args.breakseq, args.manta, args.cnvnator, args.lumpy, args.run_delly]):
+        logging.warning("Did not detect any SV modules requested by the user through command-line flags.")
+        logging.warning("Running with default SV modules: Breakdancer, Breakseq, Manta, CNVnator, Lumpy, and Delly Deletion")
+        args.breakdancer = True
+        args.breakseq = True
+        args.manta = True
+        args.cnvnator = True
+        args.lumpy = True
+        args.delly_deletion = True
 
     # Check that we have the bam and fasta index files.
     if not os.path.isfile(args.bam + '.bai'):
