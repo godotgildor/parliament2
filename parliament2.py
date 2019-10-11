@@ -6,6 +6,9 @@ import logging
 import multiprocessing
 import os
 import time
+import tempfile
+import shutil
+import re
 
 
 SV_CALLER_WEIGHTS = {
@@ -13,12 +16,33 @@ SV_CALLER_WEIGHTS = {
     'cnvnator': 1.0,
     'sambamba': 0.25,
     'manta': 8,
-    'breakseq': 0,
+    'breakseq2': 0,
     'delly': 1,
     'lumpy': 1
 }
 
+TIMEOUTS = {
+    'breakseq2': '6h',
+    'manta': '6h',
+    'breakdancer_config': '2h',
+    'breakdancer': '4h'
+}
 LUMPY_EXCLUDE_BED_FILENAME = '/resources/{genome}.bed'
+CONTIGS_FILTER = '^hs37d5|alt|_random|_decoy'
+MIN_CONTIG_LENGTH = 1000000
+LOG_FILE_DIR = './log/{tool}_log/'
+BWA_PATH = '/usr/local/bin/bwa'
+SAMTOOLS_PATH = '/usr/local/bin/samtools'
+KNOWN_BREAKPOINT_FILENAME = {
+    'hg19': None, 
+    'b37': '/breakseq2_bplib_20150129/breakseq2_bplib_20150129.gff',
+    'hg38', None
+}
+BREAKSEQ_WORK_DIR = './breakseq2'
+MANTA_WORK_DIR = './manta'
+BREAKDANCER_CFG_FILENAME = 'breakdancer.cfg'
+MIN_READS_FOR_CONTIG_ANALYSIS = 10
+
 
 class WeightedPool():
     """This class provides a multiprocessing.Pool like interface with the
@@ -49,12 +73,16 @@ class WeightedPool():
         to_delete = set()
         completed_weight = 0
 
-        for (process, weight, cmd) in self._current_pool:
+        for (process, weight, cmd, stdout, stderr) in self._current_pool:
             status = process.poll()
             # A status of None indicates the process is still running.
             if status is not None:
                 to_delete.add((process, weight, cmd))
                 completed_weight += weight
+                if stdout:
+                    stdout.close()
+                if stderr:
+                    stderr.close()
             # We'll warn if we received a non-zero exit code. Perhaps add a feature
             # later that would permit the user to choose to error instead?
             if status is not None and status != 0:
@@ -86,14 +114,16 @@ class WeightedPool():
                 subprocess.Popen())
             weight (float/int): The weight for the given process. This is the size that
                 will be taken up in our pool.
-            stdout (File handler): A file handler to store the stdout.
-            stderr (File handler): A file handler to store the stderr.
+            stdout (string): A filename to store stdout.
+            stderr (string): A filename to store stderr.
         """
         # First, wait until we have room in our 
         self._wait_for_weight(self._max_weight - weight)
+        stdout = open(stdout, 'w') if stdout else None
+        stderr = open(stderr, 'w') if stderr else None
         process = subprocess.Popen(cmd, stdout=stdout, stderr=stderr)
         self._current_weight += weight
-        self._current_pool.add((process, weight, subprocess.list2cmdline(cmd)))
+        self._current_pool.add((process, weight, subprocess.list2cmdline(cmd), stdout, stderr))
 
 
     def join(self):
@@ -170,6 +200,68 @@ def get_reference_genome_name(ref_genome_filename):
     return 'hg19'
 
 
+def get_contigs(bam_filename, filter_short_contigs):
+    """Get a list of contigs that were used during mapping.
+
+    Args:
+        bam_filename (string): The filename for mapped reads in BAM format.
+        filter_short_contigs (boolean): Should we filter out shorter contigs?
+    
+    Returns:
+        A list of contigs that met any filtering criteria.
+    """
+    contigs = []
+
+    samtools_proc = subprocess.Popen(['samtools', 'view', '-H', bam_filename], stdout=subprocess.PIPE)
+    for line in samtools_proc.stdout:
+        # Contig lines begin with @SQ
+        if line[:3] != "@SQ": 
+            continue
+        sequence_name = line.strip().split("SN:")[-1].split("\t")[0]
+        length = int(line.strip().split("LN:")[-1].split("\t")[0])
+
+        if filter_short_contigs and (re.findall(CONTIGS_FILTER, sequence_name) != [] or length < MIN_CONTIG_LENGTH):
+            continue
+        contigs.append(sequence_name)
+
+    return contigs
+
+
+def convert_cram_to_bam(cram_filename, ref_genome_filename):
+    """Convert the given CRAM file to a BAM file along with a BAM index.
+
+    Args:
+        cram_filename (string): The CRAM file
+        ref_genome_filename (string): The filename for the reference genome FASTA
+
+    Returns:
+        A string giving the path of the new BAM file.
+    """
+    # Save a core for indexing the BAM file.
+    num_cores = max(1, multiprocessing.cpu_count() - 1)
+
+    # Create a fifo to stream to so that we can create the index file while
+    # we are performing the conversion. The fifo will have our final BAM 
+    # filename, and we'll use a temp file to store the converted BAM.
+    _, temp_bam_filename = tempfile.mkstemp(suffix='.bam')
+    bam_filename = os.path.splitext(cram_filename)[0] + '.bam'
+    os.mkfifo(bam_filename)
+    
+    with open(temp_bam_filename, 'w') as bam_fh:
+        cmd = ['samtools', 'view', cram_filename, '-bh', '-@', str(num_cores), '-T', ref_genome_filename, '-o', '-']
+        convert_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+            
+        cmd = ['tee', bam_filename]
+        tee_proc = subprocess.Popen(cmd, stdin=convert_proc.stdout, stdout=bam_fh)
+
+        cmd = ['samtools', 'index', bam_filename]
+        samtools_proc = subprocess.check_call(cmd)
+    
+    shutil.move(temp_bam_filename, bam_filename)
+
+    return bam_filename
+
+
 def gunzip_input(filename, overwrite=False):
     """Gunzip the given file.
 
@@ -189,6 +281,32 @@ def gunzip_input(filename, overwrite=False):
         subprocess.check_call(['gunzip', '-f', filename])
     
     return prefix
+
+
+def skip_contig_analysis(contig, bam_filename):
+    """Checks whether the given contig should be skipped in our SV analysis.
+    Currently this check simply looks to see if there are some minimum number
+    of reads that mapped to the given contg.
+
+    Args:
+        contig (string): The contig name that we may want to analyze.
+        bam_filename (string): The filename for mapped reads in BAM format.
+
+    Returns:
+        A boolean indicating whether the contig should be skipped because it
+        failed to meet our criteria for analysis.
+    """
+    cmd = [
+        'samtools', 'view',
+        contig
+    ]
+    samtools_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    for i, line in enumerate(samtools_proc.stdout):
+        if i >= MIN_READS_FOR_CONTIG_ANALYSIS-1:
+            samtools_proc.kill()
+            return False
+    
+    return True
 
 
 def run_parliament(bam_filename, 
@@ -227,7 +345,106 @@ def run_parliament(bam_filename,
         svviz (boolean): Should we create visualization outputs?
         svviz_only_validated_candidates (boolean): Should we run only visualize validated candidates?
     """
-    lumpy_bed = LUMPY_EXCLUDE_BED_FILENAME.format(genome=get_reference_genome_name(ref_genome_filename))
+    genome_name = get_reference_genome_name(ref_genome_filename)
+    pool = WeightedPool()
+
+    if breakseq or manta:
+        logging.info('Launching jobs that cannot be parallelized by contig')
+    
+    # BreakSeq
+    if breakseq:
+        logging.info('Running BreakSeq')
+        log_dirs = LOG_FILE_DIR.format(tool='breakseq2')
+        os.makedirs(log_dirs)
+        cmd = [
+            'timeout', TIMEOUTS['breakseq2']
+            '/home/dnanexus/breakseq2-2.2/scripts/run_breakseq2.py', 
+            '--reference', ref_genome_filename,
+            '--bams', bam_filename,
+            '--work', BREAKSEQ_WORK_DIR,
+            '--bwa', BWA_PATH,
+            '--samtools', SAMTOOLS_PATH,
+            '--nthread', str(multiprocessing.cpu_count()),
+            '--sample', prefix
+        ]
+        bplib_gff = KNOWN_BREAKPOINT_FILENAME[genome_name]
+        if bplib_gff is not None:
+            cmd.extend(['--bplib_gff', bplib_gff])
+        else:
+            logging.warning('No known breakpoint file for {} genome.'.format(genome_name))
+
+        stdout_filename = os.path.join(log_dirs, '{}.breakseq2.stdout'.format(prefix))
+        stderr_filename = os.path.join(log_dirs, '{}.breakseq2.stderr'.format(prefix))
+        pool.apply_async(cmd, SV_CALLER_WEIGHTS['breakseq2'], stdout=stdout_filename, stderr=stderr_filename)
+    
+    if manta:
+        logging.info('Running Manta')
+        log_dirs = LOG_FILE_DIR.format(tool='manta')
+        os.makedirs(log_dirs)
+        
+        contigs = get_contigs(bam_filename, filter_short_contigs)
+        cmd = [
+            'python', '/miniconda/bin/configManta.py',
+            '--referenceFasta', ref_genome_filename,
+            '--normalBam', bam_filename,
+            '--runDir', MANTA_WORK_DIR
+        ]
+        cmd += ['--region={}'.format(contig) for contig in contigs]
+        subprocess.check_call(cmd)
+
+        # The original script had the number of cores hard-coded to 16. I'm assuming that
+        # was under the assumption that it was being run on a 32 core machine? I'm changing
+        # this logic so that it will use half of the total cores available, but max out at 16.
+        # This can be changed if there are better and more informed opinions.
+        num_cores = min(multiprocessing.cpu_count()/2, 16)
+        cmd = [
+            'timeout', TIMEOUTS['manta'],
+            'python', os.path.join(MANTA_WORK_DIR, 'runWorkflow.py'),
+            '-m', 'local',
+            '-j', str(num_cores)
+        ]
+        stdout_filename = os.path.join(log_dirs, '{}.manta.stdout'.format(prefix))
+        stderr_filename = os.path.join(log_dirs, '{}.manta.stderr'.format(prefix))
+        pool.apply_async(cmd, weight=num_cores, stdout=stdout_filename, stderr=stderr_filename)
+    
+    # While Breakdancer will be run in multiple threads for each contig, we need to create a 
+    # config file first that will be used by each thread.
+    if breakdancer:
+        cmd = [
+            'timeout', TIMEOUTS['breakdancer_config'],
+            '/breakdancer/cpp/bam2cfg',
+            '-o', BREAKDANCER_CFG_FILENAME,
+            bam_filename
+        ]
+        subprocess.check_call(cmd)
+    
+    
+    #    lumpy_bed = LUMPY_EXCLUDE_BED_FILENAME.format(genome=get_reference_genome_name(ref_genome_filename))
+
+    processed_contigs = []
+    run_delly = any([delly_deletion, delly_duplication, delly_insertion, delly_inversion])
+    if cnvnator or run_delly or breakdancer or lumpy:
+        for contig in contigs:
+            # Skip this contig if we determine it shouldn't be analyzed.
+            if skip_contig_analysis(contig, bam_filename):
+                continue
+            processed_contigs.append(contig)
+
+            if breakdancer:
+                log_dirs = LOG_FILE_DIR.format(tool='breakdancer')
+                os.makedirs(log_dirs)
+                logging.info('Running Breakdancer for contig {}'.format(contig))
+                cmd = [
+                    'timeout', TIMEOUTS['breakdancer'],
+                    '/breakdancer/cpp/breakdancer-max', BREAKDANCER_CFG_FILENAME,
+                    bam_filename, 
+                    '-o', contig
+                ]
+                output_filename = 'breakdancer-{}.ctx'.format(contig)
+                stderr_filename = os.path.join(log_dirs, '{}.breakdancer.{}.stderr.log'.format(prefix, contig))
+                pool.apply_async(cmd, stdout=output_filename, stderr=stderr_filename, weight=SV_CALLER_WEIGHTS['breakdancer'])
+
+    
 
 
 def main():
@@ -248,6 +465,10 @@ def main():
         args.cnvnator = True
         args.lumpy = True
         args.delly_deletion = True
+    
+    # Check if the input bam is actually a cram file. If it is, we'll create a bam version as well.
+    if os.path.splitext(args.bam) in {'.cram', '.CRAM'}:
+        args.bam = convert_cram_to_bam(args.bam)
 
     # Check that we have the bam and fasta index files.
     if not os.path.isfile(args.bam + '.bai'):
