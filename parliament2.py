@@ -441,7 +441,7 @@ def gunzip_input(filename, overwrite=False):
 def skip_contig_analysis(contig, bam_filename):
     """Checks whether the given contig should be skipped in our SV analysis.
     Currently this check simply looks to see if there are some minimum number
-    of reads that mapped to the given contg.
+    of reads that mapped to the given contig.
 
     Parameters
     ----------
@@ -464,6 +464,50 @@ def skip_contig_analysis(contig, bam_filename):
             return False
 
     return True
+
+
+def setup_logging_env(prefix, tool, contig=None):
+    """Create the directory to hold output logs for this tool and 
+    construct possible names for the stdout and stderr logs.
+
+    Parameters
+    ----------
+    prefix : str
+            The prefix to use for outputs.
+    tool : str
+        The name of the tool that will generate logs
+    contig : str, optional
+        An optional string indicating a particular contig that
+        is being analyzed.
+
+    Returns
+    -------
+    (str, str)
+        The proposed filenames to hold stdout and sterr logs.
+    """
+    if contig:
+        logging.info("Running {} for contig {}".format(tool, contig))
+    else:
+        logging.info("Running {}".format(tool))
+
+    # Setup log directory
+    tool = tool.lower()
+    log_dirs = LOG_FILE_DIR.format(tool=tool)
+    os.makedirs(log_dirs)
+
+    # Create potential log filenames
+    if contig:
+        stdout_filename = os.path.join(
+            log_dirs, "{}.{}.{}.stdout".format(prefix, tool, contig)
+        )
+        stderr_filename = os.path.join(
+            log_dirs, "{}.{}.{}.stderr".format(prefix, tool, contig)
+        )
+    else:
+        stdout_filename = os.path.join(log_dirs, "{}.{}.stdout".format(prefix, tool))
+        stderr_filename = os.path.join(log_dirs, "{}.{}.stderr".format(prefix, tool))
+
+    return (stdout_filename, stderr_filename)
 
 
 def run_parliament(
@@ -522,6 +566,7 @@ def run_parliament(
             Should we run only visualize validated candidates?
         """
     genome_name = get_reference_genome_name(ref_genome_filename)
+    contigs = get_contigs(bam_filename, filter_short_contigs)
     pool = WeightedPool()
 
     if breakseq or manta:
@@ -529,9 +574,7 @@ def run_parliament(
 
     # BreakSeq
     if breakseq:
-        logging.info("Running BreakSeq")
-        log_dirs = LOG_FILE_DIR.format(tool="breakseq2")
-        os.makedirs(log_dirs)
+        stdout_filename, stderr_filename = setup_logging_env(prefix, "BreakSeq2")
         cmd = [
             "timeout",
             TIMEOUTS["breakseq2"],
@@ -546,11 +589,15 @@ def run_parliament(
             BWA_PATH,
             "--samtools",
             SAMTOOLS_PATH,
-            "--nthread",
+            "--nthreads",
             str(multiprocessing.cpu_count()),
             "--sample",
             prefix,
         ]
+        # Note: in original Parliament2, the code always used the file
+        # breakseq2_bplib_20150129.gff which is uses b37 coordinates. Currently,
+        # for hg19 and hg38 the code will not add a gff file, but we may want
+        # to find comparable gff files for those references or do a liftover.
         bplib_gff = KNOWN_BREAKPOINT_FILENAME[genome_name]
         if bplib_gff is not None:
             cmd.extend(["--bplib_gff", bplib_gff])
@@ -559,8 +606,6 @@ def run_parliament(
                 "No known breakpoint file for {} genome.".format(genome_name)
             )
 
-        stdout_filename = os.path.join(log_dirs, "{}.breakseq2.stdout".format(prefix))
-        stderr_filename = os.path.join(log_dirs, "{}.breakseq2.stderr".format(prefix))
         pool.apply_async(
             cmd,
             SV_CALLER_WEIGHTS["breakseq2"],
@@ -569,12 +614,10 @@ def run_parliament(
         )
 
     if manta:
-        logging.info("Running Manta")
-        log_dirs = LOG_FILE_DIR.format(tool="manta")
-        os.makedirs(log_dirs)
-
-        contigs = get_contigs(bam_filename, filter_short_contigs)
+        stdout_filename, stderr_filename = setup_logging_env(prefix, "Manta")
         cmd = [
+            "timeout",
+            TIMEOUTS["manta"],
             "python",
             "/miniconda/bin/configManta.py",
             "--referenceFasta",
@@ -603,8 +646,6 @@ def run_parliament(
             "-j",
             str(num_cores),
         ]
-        stdout_filename = os.path.join(log_dirs, "{}.manta.stdout".format(prefix))
-        stderr_filename = os.path.join(log_dirs, "{}.manta.stderr".format(prefix))
         pool.apply_async(
             cmd, weight=num_cores, stdout=stdout_filename, stderr=stderr_filename
         )
@@ -629,16 +670,16 @@ def run_parliament(
         [delly_deletion, delly_duplication, delly_insertion, delly_inversion]
     )
     if cnvnator or run_delly or breakdancer or lumpy:
+        count = 0
         for contig in contigs:
             # Skip this contig if we determine it shouldn't be analyzed.
             if skip_contig_analysis(contig, bam_filename):
                 continue
             processed_contigs.append(contig)
-
             if breakdancer:
-                log_dirs = LOG_FILE_DIR.format(tool="breakdancer")
-                os.makedirs(log_dirs)
-                logging.info("Running Breakdancer for contig {}".format(contig))
+                stdout_filename, stderr_filename = setup_logging_env(
+                    prefix, "breakdancer", contig
+                )
                 cmd = [
                     "timeout",
                     TIMEOUTS["breakdancer"],
@@ -649,15 +690,26 @@ def run_parliament(
                     contig,
                 ]
                 output_filename = "breakdancer-{}.ctx".format(contig)
-                stderr_filename = os.path.join(
-                    log_dirs, "{}.breakdancer.{}.stderr.log".format(prefix, contig)
-                )
                 pool.apply_async(
                     cmd,
                     stdout=output_filename,
                     stderr=stderr_filename,
                     weight=SV_CALLER_WEIGHTS["breakdancer"],
                 )
+
+            if cnvnator:
+                stdout_filename, stderr_filename = setup_logging_env(
+                    prefix, "CNVnator", contig
+                )
+                cmd = ["runCNVnator", contig, str(count)]
+                pool.apply_async(
+                    cmd,
+                    stdout=stdout_filename,
+                    stderr=stderr_filename,
+                    weight=SV_CALLER_WEIGHTS["cnvnator"],
+                )
+
+            count += 1
 
 
 def main():
@@ -668,7 +720,6 @@ def main():
     args.run_delly = any(
         [
             args.delly_deletion,
-            args,
             args.delly_insertion,
             args.delly_inversion,
             args.delly_duplication,
@@ -705,10 +756,11 @@ def main():
         args.cnvnator = True
         args.lumpy = True
         args.delly_deletion = True
+        args.run_delly = True
 
     # Check if the input bam is actually a cram file. If it is, we'll create
     #  a bam version as well.
-    if os.path.splitext(args.bam) in {".cram", ".CRAM"}:
+    if os.path.splitext(args.bam)[-1].lower() == ".cram":
         args.bam = convert_cram_to_bam(args.bam)
 
     # Check that we have the bam and fasta index files.
