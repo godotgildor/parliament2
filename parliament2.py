@@ -9,6 +9,8 @@ import time
 import tempfile
 import shutil
 import re
+from collections import defaultdict
+from contextlib import contextmanager
 
 
 SV_CALLER_WEIGHTS = {
@@ -26,8 +28,10 @@ TIMEOUTS = {
     "manta": "6h",
     "breakdancer_config": "2h",
     "breakdancer": "4h",
+    "sambamba": "2h",
+    "delly": "6h",
 }
-LUMPY_EXCLUDE_BED_FILENAME = "/resources/{genome}.bed"
+LUMPY_EXCLUDE_BED_FILENAME = "/home/dnanexus/{genome}.bed"
 CONTIGS_FILTER = "^hs37d5|alt|_random|_decoy"
 MIN_CONTIG_LENGTH = 1000000
 LOG_FILE_DIR = "./log/{tool}_log/"
@@ -510,6 +514,35 @@ def setup_logging_env(prefix, tool, contig=None):
     return (stdout_filename, stderr_filename)
 
 
+@contextmanager
+def cd(new_path=None, delete_on_exit=False):
+    """A context manager to change the current working directory.
+    If the directory does not exist, it will be created. If the
+    directory is not specified, then a random directory will be
+    created.
+
+    Parameters
+    ----------
+    new_path : str
+        The directory to change into. If None, then a random directory will
+        be created.
+    delete_on_exit : bool, optional
+        If True, delete the directory on exit, by default False
+    """
+    saved_path = os.getcwd()
+    if new_path is None:
+        new_path = tempfile.mkdtemp()
+    if not os.path.isdir(new_path):
+        os.makedirs(new_path)
+    os.chdir(new_path)
+    try:
+        yield
+    finally:
+        os.chdir(saved_path)
+        if delete_on_exit:
+            shutil.rmtree(new_path)
+
+
 def run_parliament(
     bam_filename,
     ref_genome_filename,
@@ -567,149 +600,324 @@ def run_parliament(
         """
     genome_name = get_reference_genome_name(ref_genome_filename)
     contigs = get_contigs(bam_filename, filter_short_contigs)
+    output_files = defaultdict(list)
     pool = WeightedPool()
 
     if breakseq or manta:
         logging.info("Launching jobs that cannot be parallelized by contig")
 
-    # BreakSeq
-    if breakseq:
-        stdout_filename, stderr_filename = setup_logging_env(prefix, "BreakSeq2")
-        cmd = [
-            "timeout",
-            TIMEOUTS["breakseq2"],
-            "/home/dnanexus/breakseq2-2.2/scripts/run_breakseq2.py",
-            "--reference",
-            ref_genome_filename,
-            "--bams",
-            bam_filename,
-            "--work",
-            BREAKSEQ_WORK_DIR,
-            "--bwa",
-            BWA_PATH,
-            "--samtools",
-            SAMTOOLS_PATH,
-            "--nthreads",
-            str(multiprocessing.cpu_count()),
-            "--sample",
-            prefix,
-        ]
-        # Note: in original Parliament2, the code always used the file
-        # breakseq2_bplib_20150129.gff which is uses b37 coordinates. Currently,
-        # for hg19 and hg38 the code will not add a gff file, but we may want
-        # to find comparable gff files for those references or do a liftover.
-        bplib_gff = KNOWN_BREAKPOINT_FILENAME[genome_name]
-        if bplib_gff is not None:
-            cmd.extend(["--bplib_gff", bplib_gff])
-        else:
-            logging.warning(
-                "No known breakpoint file for {} genome.".format(genome_name)
+    with cd(delete_on_exit=True):
+        # BreakSeq
+        if breakseq:
+            stdout_filename, stderr_filename = setup_logging_env(prefix, "BreakSeq2")
+            cmd = [
+                "timeout",
+                TIMEOUTS["breakseq2"],
+                "/home/dnanexus/breakseq2-2.2/scripts/run_breakseq2.py",
+                "--reference",
+                ref_genome_filename,
+                "--bams",
+                bam_filename,
+                "--work",
+                BREAKSEQ_WORK_DIR,
+                "--bwa",
+                BWA_PATH,
+                "--samtools",
+                SAMTOOLS_PATH,
+                "--nthreads",
+                str(multiprocessing.cpu_count()),
+                "--sample",
+                prefix,
+            ]
+            # Note: in original Parliament2, the code always used the file
+            # breakseq2_bplib_20150129.gff which is uses b37 coordinates. Currently,
+            # for hg19 and hg38 the code will not add a gff file, but we may want
+            # to find comparable gff files for those references or do a liftover.
+            bplib_gff = KNOWN_BREAKPOINT_FILENAME[genome_name]
+            if bplib_gff is not None:
+                cmd.extend(["--bplib_gff", bplib_gff])
+            else:
+                logging.warning(
+                    "No known breakpoint file for {} genome.".format(genome_name)
+                )
+
+            pool.apply_async(
+                cmd,
+                SV_CALLER_WEIGHTS["breakseq2"],
+                stdout=stdout_filename,
+                stderr=stderr_filename,
             )
 
-        pool.apply_async(
-            cmd,
-            SV_CALLER_WEIGHTS["breakseq2"],
-            stdout=stdout_filename,
-            stderr=stderr_filename,
+        if manta:
+            stdout_filename, stderr_filename = setup_logging_env(prefix, "Manta")
+            cmd = [
+                "timeout",
+                TIMEOUTS["manta"],
+                "python",
+                "/miniconda/bin/configManta.py",
+                "--referenceFasta",
+                ref_genome_filename,
+                "--normalBam",
+                bam_filename,
+                "--runDir",
+                MANTA_WORK_DIR,
+            ]
+            cmd += ["--region={}".format(contig) for contig in contigs]
+            subprocess.check_call(cmd)
+
+            # The original script had the number of cores hard-coded to 16. I'm assuming
+            # that was under the assumption that it was being run on a 32 core machine?
+            # I'm changing this logic so that it will use half of the total cores
+            # available, but max out at 16. This can be changed if there are better and
+            # more informed opinions.
+            num_cores = min(multiprocessing.cpu_count() / 2, 16)
+            cmd = [
+                "timeout",
+                TIMEOUTS["manta"],
+                "python",
+                os.path.join(MANTA_WORK_DIR, "runWorkflow.py"),
+                "-m",
+                "local",
+                "-j",
+                str(num_cores),
+            ]
+            pool.apply_async(
+                cmd, weight=num_cores, stdout=stdout_filename, stderr=stderr_filename
+            )
+
+        # While Breakdancer will be run in multiple threads for each contig, we need to
+        # create a config file first that will be used by each thread.
+        if breakdancer:
+            cmd = [
+                "timeout",
+                TIMEOUTS["breakdancer_config"],
+                "/breakdancer/cpp/bam2cfg",
+                "-o",
+                BREAKDANCER_CFG_FILENAME,
+                bam_filename,
+            ]
+            subprocess.check_call(cmd)
+
+        lumpy_bed = LUMPY_EXCLUDE_BED_FILENAME.format(genome=genome_name)
+
+        processed_contigs = []
+        run_delly = any(
+            [delly_deletion, delly_duplication, delly_insertion, delly_inversion]
         )
+        if cnvnator or run_delly or breakdancer or lumpy:
+            count = 0
+            for contig in contigs:
+                # Skip this contig if we determine it shouldn't be analyzed.
+                if skip_contig_analysis(contig, bam_filename):
+                    continue
+                processed_contigs.append(contig)
+                if breakdancer:
+                    stdout_filename, stderr_filename = setup_logging_env(
+                        prefix, "breakdancer", contig
+                    )
+                    cmd = [
+                        "timeout",
+                        TIMEOUTS["breakdancer"],
+                        "/breakdancer/cpp/breakdancer-max",
+                        BREAKDANCER_CFG_FILENAME,
+                        bam_filename,
+                        "-o",
+                        contig,
+                    ]
+                    output_filename = "breakdancer-{}.ctx".format(contig)
+                    pool.apply_async(
+                        cmd,
+                        stdout=output_filename,
+                        stderr=stderr_filename,
+                        weight=SV_CALLER_WEIGHTS["breakdancer"],
+                    )
+                    output_files["breakdancer"].append(output_filename)
 
-    if manta:
-        stdout_filename, stderr_filename = setup_logging_env(prefix, "Manta")
-        cmd = [
-            "timeout",
-            TIMEOUTS["manta"],
-            "python",
-            "/miniconda/bin/configManta.py",
-            "--referenceFasta",
-            ref_genome_filename,
-            "--normalBam",
-            bam_filename,
-            "--runDir",
-            MANTA_WORK_DIR,
-        ]
-        cmd += ["--region={}".format(contig) for contig in contigs]
-        subprocess.check_call(cmd)
+                if cnvnator:
+                    stdout_filename, stderr_filename = setup_logging_env(
+                        prefix, "CNVnator", contig
+                    )
+                    cmd = ["runCNVnator", contig, str(count)]
+                    pool.apply_async(
+                        cmd,
+                        stdout=stdout_filename,
+                        stderr=stderr_filename,
+                        weight=SV_CALLER_WEIGHTS["cnvnator"],
+                    )
+                    output_files["cnvnator"].append(
+                        "output.cnvnator_calls-{}".format(count)
+                    )
 
-        # The original script had the number of cores hard-coded to 16. I'm assuming
-        # that was under the assumption that it was being run on a 32 core machine?
-        # I'm changing this logic so that it will use half of the total cores
-        # available, but max out at 16. This can be changed if there are better and
-        # more informed opinions.
-        num_cores = min(multiprocessing.cpu_count() / 2, 16)
-        cmd = [
-            "timeout",
-            TIMEOUTS["manta"],
-            "python",
-            os.path.join(MANTA_WORK_DIR, "runWorkflow.py"),
-            "-m",
-            "local",
-            "-j",
-            str(num_cores),
-        ]
-        pool.apply_async(
-            cmd, weight=num_cores, stdout=stdout_filename, stderr=stderr_filename
-        )
+                # Running either Delly or Lumpy requires us to create a bam file of the
+                # given contig.
+                if run_delly or lumpy:
+                    _, stderr_filename = setup_logging_env(prefix, "sambamba", contig)
+                    bam_contig_filename = "{}.{}.bam".format(prefix, contig)
+                    cmd = [
+                        "timeout",
+                        TIMEOUTS["sambamba"],
+                        "sambamba",
+                        "view",
+                        "-h",
+                        "-f",
+                        "bam",
+                        "-t",
+                        str(multiprocessing.cpu_count()),
+                        bam_filename,
+                        contig,
+                    ]
+                    with open(bam_contig_filename, "wb") as bam_contig_fh, open(
+                        stderr_filename, "wb"
+                    ) as stderr_fh:
+                        subprocess.check_call(
+                            cmd, stdout=bam_contig_fh, stderr=stderr_fh
+                        )
 
-    # While Breakdancer will be run in multiple threads for each contig, we need to
-    # create a config file first that will be used by each thread.
-    if breakdancer:
-        cmd = [
-            "timeout",
-            TIMEOUTS["breakdancer_config"],
-            "/breakdancer/cpp/bam2cfg",
-            "-o",
-            BREAKDANCER_CFG_FILENAME,
-            bam_filename,
-        ]
-        subprocess.check_call(cmd)
+                    cmd = [
+                        "sambamba",
+                        "index",
+                        "-t",
+                        str(multiprocessing.cpu_count()),
+                        bam_contig_filename,
+                    ]
+                    subprocess.check_call(cmd)
 
-    #    lumpy_bed = LUMPY_EXCLUDE_BED_FILENAME.format(genome=get_reference_genome_name(ref_genome_filename))
+                if delly_deletion:
+                    stdout_filename, stderr_filename = setup_logging_env(
+                        prefix, "Delly_Deletion", contig
+                    )
+                    delly_deletion_vcf_filename = "{}.{}.delly_deletion.vcf".format(
+                        prefix, contig
+                    )
+                    cmd = [
+                        "timeout",
+                        TIMEOUTS["delly"],
+                        "delly",
+                        "-t",
+                        "DEL",
+                        "-o",
+                        delly_deletion_vcf_filename,
+                        "-g",
+                        ref_genome_filename,
+                        bam_contig_filename,
+                    ]
+                    pool.apply_async(
+                        cmd,
+                        stdout=stdout_filename,
+                        stderr=stderr_filename,
+                        weight=SV_CALLER_WEIGHTS["delly"],
+                    )
+                    output_files["delly_deletion"].append(delly_deletion_vcf_filename)
 
-    processed_contigs = []
-    run_delly = any(
-        [delly_deletion, delly_duplication, delly_insertion, delly_inversion]
-    )
-    if cnvnator or run_delly or breakdancer or lumpy:
-        count = 0
-        for contig in contigs:
-            # Skip this contig if we determine it shouldn't be analyzed.
-            if skip_contig_analysis(contig, bam_filename):
-                continue
-            processed_contigs.append(contig)
-            if breakdancer:
-                stdout_filename, stderr_filename = setup_logging_env(
-                    prefix, "breakdancer", contig
-                )
-                cmd = [
-                    "timeout",
-                    TIMEOUTS["breakdancer"],
-                    "/breakdancer/cpp/breakdancer-max",
-                    BREAKDANCER_CFG_FILENAME,
-                    bam_filename,
-                    "-o",
-                    contig,
-                ]
-                output_filename = "breakdancer-{}.ctx".format(contig)
-                pool.apply_async(
-                    cmd,
-                    stdout=output_filename,
-                    stderr=stderr_filename,
-                    weight=SV_CALLER_WEIGHTS["breakdancer"],
-                )
+                if delly_inversion:
+                    stdout_filename, stderr_filename = setup_logging_env(
+                        prefix, "Delly_Inversion", contig
+                    )
+                    delly_inversion_vcf_filename = "{}.{}.delly_inversion.vcf".format(
+                        prefix, contig
+                    )
+                    cmd = [
+                        "timeout",
+                        TIMEOUTS["delly"],
+                        "delly",
+                        "-t",
+                        "INV",
+                        "-o",
+                        delly_inversion_vcf_filename,
+                        "-g",
+                        ref_genome_filename,
+                        bam_contig_filename,
+                    ]
+                    pool.apply_async(
+                        cmd,
+                        stdout=stdout_filename,
+                        stderr=stderr_filename,
+                        weight=SV_CALLER_WEIGHTS["delly"],
+                    )
+                    output_files["delly_inversion"].append(delly_inversion_vcf_filename)
 
-            if cnvnator:
-                stdout_filename, stderr_filename = setup_logging_env(
-                    prefix, "CNVnator", contig
-                )
-                cmd = ["runCNVnator", contig, str(count)]
-                pool.apply_async(
-                    cmd,
-                    stdout=stdout_filename,
-                    stderr=stderr_filename,
-                    weight=SV_CALLER_WEIGHTS["cnvnator"],
-                )
+                if delly_duplication:
+                    stdout_filename, stderr_filename = setup_logging_env(
+                        prefix, "Delly_Duplication", contig
+                    )
+                    delly_duplication_vcf_filename = "{}.{}..vcf".format(prefix, contig)
+                    cmd = [
+                        "timeout",
+                        TIMEOUTS["delly"],
+                        "delly",
+                        "-t",
+                        "DUP",
+                        "-o",
+                        delly_duplication_vcf_filename,
+                        "-g",
+                        ref_genome_filename,
+                        bam_contig_filename,
+                    ]
+                    pool.apply_async(
+                        cmd,
+                        stdout=stdout_filename,
+                        stderr=stderr_filename,
+                        weight=SV_CALLER_WEIGHTS["delly"],
+                    )
+                    output_files["delly_duplication"].append(
+                        delly_duplication_vcf_filename
+                    )
 
-            count += 1
+                if delly_insertion:
+                    stdout_filename, stderr_filename = setup_logging_env(
+                        prefix, "Delly_Insertion", contig
+                    )
+                    delly_insertion_vcf_filename = "{}.{}..vcf".format(prefix, contig)
+                    cmd = [
+                        "timeout",
+                        TIMEOUTS["delly"],
+                        "delly",
+                        "-t",
+                        "INS",
+                        "-o",
+                        delly_insertion_vcf_filename,
+                        "-g",
+                        ref_genome_filename,
+                        bam_contig_filename,
+                    ]
+                    pool.apply_async(
+                        cmd,
+                        stdout=stdout_filename,
+                        stderr=stderr_filename,
+                        weight=SV_CALLER_WEIGHTS["delly"],
+                    )
+                    output_files["delly_insertion"].append(delly_insertion_vcf_filename)
+
+                if lumpy:
+                    stdout_filename, stderr_filename = setup_logging_env(
+                        prefix, "Lumpy", contig
+                    )
+                    lumpy_vcf_filename = "{}.{}.lumpy.vcf".format(prefix, contig)
+                    cmd = [
+                        "timeout",
+                        TIMEOUTS["lumpy"],
+                        "/home/dnanexus/lumpy-sv/bin/lumpyexpress",
+                        "-B",
+                        bam_contig_filename,
+                        "-o",
+                        lumpy_vcf_filename,
+                        "-x",
+                        lumpy_bed,
+                        "-k",
+                        "1",
+                    ]
+                    pool.apply_async(
+                        cmd,
+                        stdout=stdout_filename,
+                        stderr=stderr_filename,
+                        weight=SV_CALLER_WEIGHTS["lumpy"],
+                    )
+                    output_files["lumpy"].append(lumpy_vcf_filename)
+
+                count += 1
+
+        # Now wait until all SV callers have completed.
+        pool.join()
 
 
 def main():
